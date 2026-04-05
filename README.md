@@ -8,9 +8,14 @@ First MTP inference implementation for Qwen3.5 in Python. Every other framework 
 |---|---|---|
 | Baseline (stock mlx-lm) | 29.5 | 1.00x |
 | + Fused Metal kernels | 30.0 | 1.02x |
-| + MTP speculative decoding | **42.7** | **1.45x** |
+| + MTP speculative decoding | 42.7 | 1.45x |
+| + Fused rms_norm into matmul | **~45** | **~1.52x** |
 
-Measured on M4 Max (128GB, 546 GB/s bandwidth) with Qwen3.5-27B-4bit.
+Measured on M4 Max (96GB, 546 GB/s bandwidth) with Qwen3.5-27B-4bit.
+
+### Kernel Fusion: rms_norm + quantized_matmul
+
+We discovered that **8.6ms per forward pass** is spent on dispatch barriers between RMS norm and quantized matmul kernels. By fusing the norm computation into the matmul kernel's input loading (two-pass: compute RMS, then normalized dot product), we eliminate these barriers. Measured 2.0ms savings via `mx.fast.metal_kernel`; full MLX integration expected to save more.
 
 ## Quick Start
 

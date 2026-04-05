@@ -23,6 +23,11 @@ from typing import Any, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+try:
+    from .fused_kernels_t2 import fused_conv1d_silu_t2, fused_gdn_step_with_intermediate
+except ImportError:
+    from fused_kernels_t2 import fused_conv1d_silu_t2, fused_gdn_step_with_intermediate
+
 
 # ---------------------------------------------------------------------------
 # Kernel 1: fused_conv1d_silu
@@ -467,7 +472,10 @@ def mtp_generate(model, tokenizer, prompt, max_tokens=256, mtp_head=None, verbos
     import time
     from mlx_lm.models.cache import make_prompt_cache
     from mlx_lm.models.base import create_attention_mask, create_ssm_mask
-    from .mtp_head import MTPHead, load_mtp
+    try:
+        from .mtp_head import MTPHead, load_mtp
+    except ImportError:
+        from mtp_head import MTPHead, load_mtp
 
     if hasattr(model, 'language_model'):
         text_model = model.language_model.model
@@ -494,11 +502,17 @@ def mtp_generate(model, tokenizer, prompt, max_tokens=256, mtp_head=None, verbos
 
     def fwd_t2_rollback(tok0, tok1):
         """
-        T=2 forward with split-recurrence rollback.
+        T=2 forward with split-recurrence rollback (fused T=2 kernels).
 
-        Matmuls are batched at T=2 (same weight reads). Only the GDN recurrence
-        is split into two T=1 calls, capturing intermediate state refs between them.
-        On rejection, restore refs + trim KV offsets. No redo needed.
+        Matmuls are batched at T=2 (same weight reads). The GDN recurrence
+        uses fused T=2 kernels that process both tokens in a single dispatch
+        while also capturing intermediate state for rollback.
+
+        This uses 2 kernel dispatches per DeltaNet layer instead of 4:
+          - 1x fused_conv1d_silu_t2 (was 2x fused_conv1d_silu)
+          - 1x fused_gdn_step_with_intermediate (was 2x fused_gdn_step)
+
+        Saves ~48 kernel dispatches (~1ms) across 48 DeltaNet layers.
         """
         inp = mx.concatenate([tok0.reshape(1, 1), tok1.reshape(1, 1)], axis=1)
         h = text_model.embed_tokens(inp)
@@ -524,30 +538,35 @@ def mtp_generate(model, tokenizer, prompt, max_tokens=256, mtp_head=None, verbos
                 rnn_st = c[1]
                 kd = attn.key_dim
 
-                # Token 0: conv + GDN (T=1)
-                co0, conv_st = fused_conv1d_silu(conv_st, combined[:, 0:1, :], attn._conv_w_flat)
+                # Fused T=2 conv1d+SiLU: 1 dispatch instead of 2
+                co0, co1, conv_mid, conv_fin = fused_conv1d_silu_t2(
+                    conv_st, combined, attn._conv_w_flat)
+
+                # Split q/k/v from both conv outputs
                 q0 = co0[..., :kd].reshape(1, 1, attn.num_k_heads, attn.head_k_dim)
                 k0 = co0[..., kd:2*kd].reshape(1, 1, attn.num_k_heads, attn.head_k_dim)
                 v0 = co0[..., 2*kd:].reshape(1, 1, attn.num_v_heads, attn.head_v_dim)
-                out0, rnn_st = fused_gdn_step(q0, k0, v0, a_val[:, 0:1, :], b_val[:, 0:1, :],
-                                               attn._A_exp, attn.dt_bias, rnn_st, None)
-
-                # Save intermediate state (zero-copy refs, arrays are immutable)
-                delta_stash.append((conv_st, rnn_st))
-
-                # Token 1: conv + GDN (T=1, speculative)
-                co1, conv_st = fused_conv1d_silu(conv_st, combined[:, 1:2, :], attn._conv_w_flat)
                 q1 = co1[..., :kd].reshape(1, 1, attn.num_k_heads, attn.head_k_dim)
                 k1 = co1[..., kd:2*kd].reshape(1, 1, attn.num_k_heads, attn.head_k_dim)
                 v1 = co1[..., 2*kd:].reshape(1, 1, attn.num_v_heads, attn.head_v_dim)
-                out1, rnn_st = fused_gdn_step(q1, k1, v1, a_val[:, 1:2, :], b_val[:, 1:2, :],
-                                               attn._A_exp, attn.dt_bias, rnn_st, None)
 
-                c[0] = conv_st
-                c[1] = rnn_st
+                # Concatenate to T=2 for fused GDN kernel
+                q_t2 = mx.concatenate([q0, q1], axis=1)
+                k_t2 = mx.concatenate([k0, k1], axis=1)
+                v_t2 = mx.concatenate([v0, v1], axis=1)
 
-                # Recombine for batched output projection + MLP
-                out = mx.concatenate([out0, out1], axis=1)
+                # Fused T=2 GDN step: 1 dispatch instead of 2
+                out, rnn_fin, rnn_mid = fused_gdn_step_with_intermediate(
+                    q_t2, k_t2, v_t2, a_val, b_val,
+                    attn._A_exp, attn.dt_bias, rnn_st)
+
+                # Save intermediate state for rollback (zero-copy refs)
+                delta_stash.append((conv_mid, rnn_mid))
+
+                c[0] = conv_fin
+                c[1] = rnn_fin
+
+                # Batched output projection + MLP
                 out = attn.norm(out, z)
                 r = attn.out_proj(out.reshape(1, 2, -1))
                 h = h + r
